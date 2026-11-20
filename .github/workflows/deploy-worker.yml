@@ -1,0 +1,92 @@
+name: Deploy Worker
+
+# 上游同步（sync.yml）更新 _worker.js 后，自动把新代码部署到 Cloudflare Worker。
+# 走 Cloudflare REST API 原样上传，不使用 wrangler：wrangler 会 esbuild 打包，
+# 曾把 5.1MB 脚本压成 382KB 并导致运行时 1101，这条路径已废弃。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '_worker.js'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build metadata
+        env:
+          EDT_ADMIN: ${{ secrets.EDT_ADMIN }}
+          EDT_UUID: ${{ secrets.EDT_UUID }}
+        run: |
+          python3 -c '
+          import json, os
+          meta = {
+            "main_module": "_worker.js",
+            "compatibility_date": "2026-05-25",
+            "bindings": [
+              {"type": "plain_text", "name": "ADMIN", "text": os.environ["EDT_ADMIN"]},
+              {"type": "plain_text", "name": "UUID", "text": os.environ["EDT_UUID"]},
+              {"type": "kv_namespace", "name": "KV", "namespace_id": "20c72c225635455bb3b3dc2bcd7dea89"},
+            ],
+          }
+          json.dump(meta, open("/tmp/metadata.json", "w"))
+          '
+          echo "worker bytes: $(wc -c < _worker.js)"
+          echo "metadata bytes: $(wc -c < /tmp/metadata.json)"
+          echo "version line: $(head -c 120 _worker.js | tr -d '\000')"
+
+      - name: Deploy via Cloudflare API
+        env:
+          CF_TOKEN: ${{ secrets.CF_WORKER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CF_TOKEN:-}" ]; then echo "::error::missing CF_WORKER_TOKEN secret"; exit 1; fi
+          set +e
+          curl -sS -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/fb56b6c76f2bec91faf2da9c4a81a26b/workers/scripts/edgetunnel" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -F "metadata=@/tmp/metadata.json;type=application/json" \
+            -F "_worker.js=@_worker.js;type=application/javascript+module" \
+            -o /tmp/resp.json -w "%{http_code}" > /tmp/code.txt
+          set -e
+          CODE=$(cat /tmp/code.txt)
+          echo "upload http=$CODE"
+          head -c 1500 /tmp/resp.json; echo
+          if [ "${CODE}" != "200" ]; then echo "::error::deploy failed http=${CODE}"; exit 1; fi
+          python3 -c '
+          import json
+          r = (json.load(open("/tmp/resp.json")).get("result") or {})
+          print("tag:", r.get("tag"))
+          print("handlers:", r.get("handlers"))
+          print("has_modules:", r.get("has_modules"))
+          if not r.get("handlers"): raise SystemExit("::error::handlers missing - module format not accepted")
+          '
+
+      - name: Verify live endpoints
+        env:
+          EDT_UUID: ${{ secrets.EDT_UUID }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            sleep 12
+            V=$(curl -sS --max-time 30 "https://cf.flyge.ccwu.cc/version?uuid=${EDT_UUID}" || true)
+            if echo "$V" | grep -q '"Version"'; then break; fi
+            echo "attempt $i: $V"
+          done
+          echo "live version: $V"
+          echo "$V" | grep -q '"Version"' || { echo "::error::live version verify failed"; exit 1; }
+          L=$(curl -sS --max-time 30 -o /dev/null -w "%{http_code}" "https://cf.flyge.ccwu.cc/login")
+          echo "login http: $L"
+          [ "$L" = "200" ] || { echo "::error::login not 200"; exit 1; }
